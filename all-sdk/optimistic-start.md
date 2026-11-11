@@ -45,6 +45,79 @@ tasks (used for updates) and the `discard_speculative_workflow_task_with_events`
 * Respecting task queue rate limits, fairness or priority for optimistic activities.
 * Child workflows, Nexus operations or any command the worker can't execute itself.
 
+## Why not a local embedded server?
+
+[Local/Embedded Server for granular durability](https://app.notion.com/p/temporalio/Local-Embedded-Server-for-granular-durability-3a48fc56773880208e27f3c152d9a9fd)
+proposes that SDKs run a local copy of the server, for example compiled to WASM, and flush progress
+to the real server on some cadence. The two proposals overlap heavily:
+
+* **Same problem.** Recording every step costs a server round trip. Local activities, the current
+  workaround, are a separate and fragile programming model.
+* **Same goal.** Both want plain activities that start on the worker and get recorded later, in
+  batches.
+
+**Optimistic start gets most of that value with a much simpler model, and it can be built today.**
+It keeps the interaction with the server that exists now: the worker sends commands in a workflow
+task completion, and the server validates them and writes ordinary history. There's nothing extra
+to deploy. An embedded server needs a new interaction model with the server to be designed first.
+
+### Goals compared
+
+| Embedded server goal | Optimistic start |
+| --- | --- |
+| Replace local activities with activities that start locally | Yes. Activities and timers inside speculative blocks start on the worker right away, and history records ordinary activity and timer events. |
+| Best latency | Yes. Work inside a window needs no round trip per step. One workflow task replaces a round trip per activity and timer. |
+| Save cost on steps that don't need to be durable one by one | Yes. A whole window is recorded in one workflow task completion. |
+| Keep work near local resources (sessions, sticky activities) | Partly. Work stays on the worker for the window, and handed-off activities keep running there. |
+| Progress while partitioned from the server | No. A window can't outlive a workflow task. |
+
+### What an embedded server needs that optimistic start doesn't
+
+* **A server runtime in every worker** (WASM or a sidecar), kept compatible with the real server's
+  version.
+* **A flush protocol** for local history, with rules for rejecting stale flushes.
+* **A way to get signals, updates and cancellations to the local server**, either by forwarding
+  them or by triggering a flush.
+* **Lease semantics** for work the worker holds between flushes, and rules for when the server
+  takes it back.
+
+Optimistic start reuses what already exists:
+
+* the workflow task completion as the flush
+* the eager activity path for handoff
+* paginated completions for large batches
+* the local activity heartbeat timing for the window deadline
+
+Prompt delivery of external events comes from
+[Workflow Heartbeat Notification (WHN)](https://app.notion.com/p/temporalio/Workflow-Heartbeat-Notification-WHN-3f48fc567738805d8195cfb2d456a24b),
+which is already in design review for local activities. A prototype covering the API, server, Core
+and four SDKs already runs end to end (see [Prototype](#prototype)).
+
+### What an embedded server wouldn't add
+
+Two apparent advantages don't hold up:
+
+* **Durability across a worker crash.** Local storage isn't needed. When a worker crashes, the
+  server should hand the workflow to another worker, which replays from the last recorded point and
+  runs the lost activities again. Waiting for the crashed host's disk would only save that re-run,
+  and activities are at-least-once anyway.
+* **Recording less.** Any worker that replays the workflow needs the full history. So an embedded
+  server can batch writes but can't skip events, and optimistic start already batches a whole
+  window into one completion.
+
+### What's left
+
+Two advantages remain: running ahead for longer than one workflow task, and making progress while
+partitioned. Neither needs a new runtime:
+
+* **Running ahead for longer:** worker ownership across workflow task heartbeats (see
+  [Future Work](#future-work)).
+* **Partitioned workers:** a long lease. The server waits for the worker instead of reassigning its
+  work, at the cost that the workflow waits if the worker really died.
+
+Both can be added to optimistic start later, on the same blocks, log and history, if there's
+demand.
+
 ## Prototype
 
 > ⚠️ **Vibe coded.** The prototype was written almost entirely by AI coding agents to validate this
@@ -108,8 +181,10 @@ operation cancellation) and temporalio/sdk-rust#1790 (late outcomes of abandoned
   free, the server may not support it, the window may be about to close. Workflow code behaves the
   same either way.
 * **Durability**: progress inside a window is not durable until the checkpoint. If the worker
-  crashes, the next worker replays from the last checkpoint and runs the activities again, without
-  increasing `attempt`. This matches local activities today.
+  crashes, the server hands the workflow to another worker. That worker replays from the last
+  checkpoint and runs the activities again without increasing `attempt`, as with local activities
+  today. The window lasts at most about 80% of the WFT timeout, which bounds the exposure. Nothing
+  is kept on the worker's disk. Recovery goes through the server, like any other workflow task.
 * **Block exit** ends the window unless another speculative block keeps it going (see
   [Block exit](#block-exit)). Code after the block doesn't wait for a round trip. Its commands land
   in the same batch after the block's entries, and the server applies the batch atomically and in
@@ -120,7 +195,12 @@ operation cancellation) and temporalio/sdk-rust#1790 (late outcomes of abandoned
 * **Async activity completion** isn't supported for optimistically started activities (see
   [Edge cases](#edge-cases)).
 * Signals, updates, workflow cancellation and results of non-optimistic work that arrive during a
-  window are delivered at the next checkpoint (at most ~80% of the WFT timeout later).
+  window are delivered at the next checkpoint. With
+  [Workflow Heartbeat Notification (WHN)](https://app.notion.com/p/temporalio/Workflow-Heartbeat-Notification-WHN-3f48fc567738805d8195cfb2d456a24b),
+  the server notifies the worker as soon as one arrives and the SDK checkpoints right away, so
+  delivery takes about a round trip. Without WHN, delivery can take up to ~80% of the WFT timeout.
+  Activity results trigger WHN only when the activity was scheduled with
+  `request_eager_result_delivery`.
 * Queries are answered from in-memory state, including progress that hasn't been checkpointed yet
   (same as local activities).
 
@@ -150,6 +230,8 @@ The SDK checkpoints when any of these happens:
 5. A speculative command can't run optimistically (different task queue, no free slot). It becomes
    a normal command, which can't be deferred.
 6. The workflow completes, fails or continues as new.
+7. The server reports through WHN that an input is waiting for this workflow task (not in the
+   prototype yet).
 
 There's no payload budget. Large batches rely on paginated WFT completions, which Core already uses
 when the namespace has the `workflow_task_completion_pagination` capability.
@@ -973,9 +1055,9 @@ Go and Java are out of scope for now.
 
 * Worker ownership across WFT heartbeats: the server keeps timers paused while the worker holds the
   WFT, so long activities avoid the handoff round trip.
+* A long lease for workers that keep running while partitioned from the server (see
+  [Why not a local embedded server?](#why-not-a-local-embedded-server)).
 * Local retries of optimistic activities.
-* The server telling a worker to checkpoint (through `worker_control_task_queue`) when signals,
-  updates or cancellations arrive during a window.
 * Optimistic start across workers in the same process (for example several task queues in one
   Spring Boot app), so activities on another task queue can still start locally.
 * Speculative child workflows: a child workflow whose code contains speculative blocks could start
